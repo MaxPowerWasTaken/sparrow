@@ -12,11 +12,19 @@ This module implements data structure for Sparrow ML model fine-tuning. We are u
 pip install -r requirements.txt
 ```
 
-2. Install Poppler, required for pdf2image to work (macos example)
+2. Install Poppler, required for pdf2image to work
 
+On Mac:
 ```
 brew install poppler
 ```
+
+On Ubuntu:
+```
+sudo apt-get update
+sudo apt-get install libpoppler-dev
+```
+
 
 3. Mindee docTR OCR installation with dependencies
 
