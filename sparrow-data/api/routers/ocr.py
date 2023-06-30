@@ -1,5 +1,5 @@
-from fastapi import APIRouter, File, UploadFile, Form
-from typing import Optional
+from fastapi import APIRouter, File, UploadFile, Form, HTTPException, status
+from fastapi.responses import JSONResponse
 from config import settings
 from PIL import Image
 import urllib.request
@@ -12,11 +12,57 @@ from paddleocr import PaddleOCR
 from pdf2image import convert_from_bytes
 import io
 import json
-from routers.ocr_utils import merge_data
-from routers.ocr_utils import store_data
+from routers.data_utils import merge_data
+from routers.data_utils import store_data
+import motor.motor_asyncio
+from typing import Optional
+from pymongo import ASCENDING
+from pymongo.errors import DuplicateKeyError
 
 
 router = APIRouter()
+
+client = None
+db = None
+
+
+async def create_unique_index(collection, *fields):
+    index_fields = [(field, 1) for field in fields]
+    return await collection.create_index(index_fields, unique=True)
+
+
+
+async def create_ttl_index(db, collection_name, field, expire_after_seconds):
+    # Get a reference to your collection
+    collection = db[collection_name]
+    # Create an index on the specified field
+    index_result = await collection.create_index([(field, ASCENDING)], expireAfterSeconds=expire_after_seconds)
+    print(f"TTL index created or already exists: {index_result}")
+
+
+@router.on_event("startup")
+async def startup_event():
+    if "MONGODB_URL" in os.environ:
+        global client
+        global db
+        client = motor.motor_asyncio.AsyncIOMotorClient(os.environ["MONGODB_URL"])
+        db = client.chatgpt_plugin
+
+        index_result = await create_unique_index(db['uploads'], 'receipt_key')
+        print(f"Unique index created or already exists: {index_result}")
+        index_result = await create_unique_index(db['receipts'], 'user', 'receipt_key')
+        print(f"Unique index created or already exists: {index_result}")
+        await create_ttl_index(db, 'uploads', 'created_at', 15*60)
+
+        print("Connected to MongoDB from OCR!")
+
+
+@router.on_event("shutdown")
+async def shutdown_event():
+    if "MONGODB_URL" in os.environ:
+        global client
+        client.close()
+
 
 @lru_cache(maxsize=1)
 def load_ocr_model():
@@ -59,12 +105,12 @@ def invoke_ocr(doc, content_type):
 
 @router.post("/ocr")
 async def run_ocr(file: Optional[UploadFile] = File(None), image_url: Optional[str] = Form(None),
-                  postprocessing: Optional[bool] = Form(False), sparrow_key: str = Form(None)):
+                  post_processing: Optional[bool] = Form(False), sparrow_key: str = Form(None)):
 
     if sparrow_key != settings.sparrow_key:
         return {"error": "Invalid Sparrow key."}
 
-    result = []
+    result = None
     if file:
         if file.content_type in ["image/jpeg", "image/jpg", "image/png"]:
             doc = Image.open(BytesIO(await file.read()))
@@ -80,9 +126,12 @@ async def run_ocr(file: Optional[UploadFile] = File(None), image_url: Optional[s
         utils.log_stats(settings.ocr_stats_file, [processing_time, file.filename])
         print(f"Processing time OCR: {processing_time:.2f} seconds")
 
-        if postprocessing:
+        if post_processing and "MONGODB_URL" in os.environ:
             print("Postprocessing...")
-            result = store_data(result)
+            try:
+                result = await store_data(result, db)
+            except DuplicateKeyError:
+                return HTTPException(status_code=400, detail=f"Duplicate data.")
             print(f"Stored data with key: {result}")
     elif image_url:
         # test image url: https://raw.githubusercontent.com/katanaml/sparrow/main/sparrow-data/docs/input/invoices/processed/images/invoice_10.jpg
@@ -106,14 +155,20 @@ async def run_ocr(file: Optional[UploadFile] = File(None), image_url: Optional[s
         utils.log_stats(settings.ocr_stats_file, [processing_time, file_name])
         print(f"Processing time OCR: {processing_time:.2f} seconds")
 
-        if postprocessing:
+        if post_processing and "MONGODB_URL" in os.environ:
             print("Postprocessing...")
-            result = store_data(result)
+            try:
+                result = await store_data(result, db)
+            except DuplicateKeyError:
+                return HTTPException(status_code=400, detail=f"Duplicate data.")
             print(f"Stored data with key: {result}")
     else:
         result = {"info": "No input provided"}
 
-    return result
+    if result is None:
+        raise HTTPException(status_code=400, detail=f"Failed to process the input.")
+
+    return JSONResponse(status_code=status.HTTP_200_OK, content=result)
 
 
 @router.get("/statistics")
